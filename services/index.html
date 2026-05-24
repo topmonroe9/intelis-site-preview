@@ -13,6 +13,10 @@
   // Auto-hide шапка: проста и предсказуема.
   //  • scrollY ≤ 80px (на первом тёмном экране) → скрыта;
   //  • scrollY > 80px (любой контент ниже)      → видна всегда.
+  // Функция update экспортируется в window.__headerUpdate, чтобы
+  // mega-menu и drawer могли принудительно пересчитать состояние
+  // после закрытия (на iOS scroll event может не fire-иться после
+  // снятия body lock).
   (function () {
     const header = document.querySelector('[data-header]');
     if (!header) return;
@@ -26,6 +30,8 @@
       if (window.scrollY > TOP_THRESHOLD) header.classList.remove('is-hidden');
       else header.classList.add('is-hidden');
     };
+
+    window.__headerUpdate = update;
 
     const onScroll = () => { if (!raf) raf = requestAnimationFrame(update); };
     update();
@@ -88,17 +94,44 @@
 
   // Mobile drawer. Триггер открытия может быть несколько (например, в светлой
   // шапке Header и в тёмной HeroTopBar) — обрабатываем все через querySelectorAll.
+  // iOS-safe scroll-lock через position:fixed (просто overflow:hidden на body
+  // не блокирует body scroll в Safari) — сохраняем и восстанавливаем scrollY.
   (function () {
     const drawer = document.querySelector('[data-drawer]');
     const openButtons = document.querySelectorAll('[data-drawer-open]');
     if (!drawer || openButtons.length === 0) return;
     const closeButtons = document.querySelectorAll('[data-drawer-close]');
 
+    let savedScrollY = 0;
+
+    const lockScroll = () => {
+      savedScrollY = window.scrollY;
+      document.body.style.position = 'fixed';
+      document.body.style.top = `-${savedScrollY}px`;
+      document.body.style.left = '0';
+      document.body.style.right = '0';
+      document.body.style.width = '100%';
+      document.body.style.overflow = 'hidden';
+    };
+    const unlockScroll = () => {
+      document.body.style.position = '';
+      document.body.style.top = '';
+      document.body.style.left = '';
+      document.body.style.right = '';
+      document.body.style.width = '';
+      document.body.style.overflow = '';
+      window.scrollTo(0, savedScrollY);
+      // Принудительный пересчёт состояния auto-hide шапки —
+      // scroll event после ручного scrollTo может не вызвать наш handler.
+      if (typeof window.__headerUpdate === 'function') window.__headerUpdate();
+    };
+
     const setOpen = (open) => {
       drawer.classList.toggle('is-open', open);
       drawer.setAttribute('aria-hidden', open ? 'false' : 'true');
       openButtons.forEach((b) => b.setAttribute('aria-expanded', open ? 'true' : 'false'));
-      document.body.style.overflow = open ? 'hidden' : '';
+      if (open) lockScroll();
+      else unlockScroll();
     };
 
     openButtons.forEach((b) => b.addEventListener('click', () => setOpen(true)));
