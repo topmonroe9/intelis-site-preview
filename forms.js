@@ -1,19 +1,20 @@
 /**
  * Глобальный обработчик lead-форм.
  *
- * Перехватывает submit для всех `<form action="/api/lead">` через делегирование
- * на document — работает и для динамически добавленных форм.
+ * Перехватывает submit для всех `form[data-lead-form]` через делегирование на
+ * document — работает и для динамически добавленных форм.
  *
- * Состояния:
- *   - loading: дисейблит submit-кнопку, текст «Отправляем…», маленький spinner
- *   - success: форма исчезает с fade-out, на её месте — зелёный блок с галочкой
- *   - error:   красное сообщение поверх формы, кнопка «Попробовать снова»
+ * Отправка:
+ *   - если задан endpoint (window.__LEAD__.endpoint) — реальный POST (JSON) на
+ *     YC Cloud Function, которая создаёт сделку в Битрикс24;
+ *   - если endpoint пуст (preview без бэкенда) — имитация success-флоу.
  *
- * Бэкенд ещё не подключён — имитируем 800–1200ms задержку и success-флоу.
- * Чтобы протестировать error-state, добавьте в URL ?form_error=1.
+ * Антиспам: Yandex SmartCaptcha (invisible) + honeypot-поле `_hp`.
+ * UTM-метки перехватываются из URL и хранятся в sessionStorage.
  *
- * Calculator (Preact) имеет свой submit и НЕ имеет атрибута action="/api/lead",
- * поэтому селектор [action="/api/lead"] его не захватывает — конфликтов нет.
+ * Состояния: loading → success (зелёный блок) / error (красное сообщение + retry).
+ *
+ * Calculator (Preact) переиспользует отправку через window.intelisLead.send().
  */
 (function () {
   'use strict';
@@ -21,10 +22,167 @@
   if (window.__intelisFormsInit) return;
   window.__intelisFormsInit = true;
 
-  var FORM_SELECTOR = 'form[action="/api/lead"]';
+  var CFG = window.__LEAD__ || {};
+  var ENDPOINT = CFG.endpoint || '';
+  var CAPTCHA_KEY = CFG.captchaKey || '';
+
+  var FORM_SELECTOR = 'form[data-lead-form]';
   var BUSY_ATTR = 'data-busy';
 
-  // ─── helpers ───────────────────────────────────────────────────────────
+  // ─── UTM ───────────────────────────────────────────────────────────────
+  var UTM_KEYS = ['utm_source', 'utm_medium', 'utm_campaign', 'utm_content', 'utm_term'];
+  var UTM_STORE = 'intelis_utm';
+
+  function captureUtm() {
+    try {
+      var q = new URLSearchParams(window.location.search);
+      var found = {};
+      var has = false;
+      UTM_KEYS.forEach(function (k) {
+        var v = q.get(k);
+        if (v) {
+          found[k] = v;
+          has = true;
+        }
+      });
+      // Сохраняем первый источник на сессию; не перезатираем при переходах без UTM.
+      if (has && !sessionStorage.getItem(UTM_STORE)) {
+        sessionStorage.setItem(UTM_STORE, JSON.stringify(found));
+      }
+    } catch (_) {}
+  }
+
+  function getStoredUtm() {
+    try {
+      return JSON.parse(sessionStorage.getItem(UTM_STORE) || '{}');
+    } catch (_) {
+      return {};
+    }
+  }
+
+  captureUtm();
+
+  // ─── SmartCaptcha (invisible) ────────────────────────────────────────────
+  var _captchaLoading = null;
+
+  function ensureCaptcha() {
+    if (window.smartCaptcha) return Promise.resolve(window.smartCaptcha);
+    if (_captchaLoading) return _captchaLoading;
+    _captchaLoading = new Promise(function (resolve, reject) {
+      var s = document.createElement('script');
+      s.src = 'https://smartcaptcha.yandexcloud.net/captcha.js';
+      s.defer = true;
+      s.onload = function () {
+        var tries = 0;
+        (function wait() {
+          if (window.smartCaptcha) return resolve(window.smartCaptcha);
+          if (tries++ > 50) return reject(new Error('captcha_unavailable'));
+          setTimeout(wait, 100);
+        })();
+      };
+      s.onerror = function () {
+        reject(new Error('captcha_script_error'));
+      };
+      document.head.appendChild(s);
+    });
+    return _captchaLoading;
+  }
+
+  /**
+   * Возвращает Promise<token>. Для каждого контейнера лениво создаёт один
+   * invisible-виджет и переиспользует его (reset перед каждым execute).
+   */
+  function getCaptchaToken(container) {
+    if (!CAPTCHA_KEY) return Promise.resolve('');
+    return ensureCaptcha().then(function (sc) {
+      return new Promise(function (resolve, reject) {
+        var widget = container.__captchaWidget;
+        if (widget == null) {
+          var box = document.createElement('div');
+          box.style.display = 'none';
+          container.appendChild(box);
+          widget = sc.render(box, {
+            sitekey: CAPTCHA_KEY,
+            invisible: true,
+            callback: function (token) {
+              var r = container.__captchaResolve;
+              container.__captchaResolve = null;
+              if (r) r(token);
+            },
+          });
+          container.__captchaWidget = widget;
+        }
+        container.__captchaResolve = resolve;
+        sc.reset(widget);
+        sc.execute(widget);
+        setTimeout(function () {
+          if (container.__captchaResolve) {
+            container.__captchaResolve = null;
+            reject(new Error('captcha_timeout'));
+          }
+        }, 25000);
+      });
+    });
+  }
+
+  // ─── Отправка заявки ─────────────────────────────────────────────────────
+  /**
+   * Отправляет заявку на бэкенд. `container` — DOM-элемент (форма) для рендера
+   * невидимой капчи. Возвращает Promise, который реджектится при ошибке.
+   */
+  function sendLead(payload, container) {
+    return getCaptchaToken(container).then(function (token) {
+      var body = {};
+      for (var k in payload) {
+        if (Object.prototype.hasOwnProperty.call(payload, k)) body[k] = payload[k];
+      }
+      var utm = getStoredUtm();
+      for (var u in utm) {
+        if (Object.prototype.hasOwnProperty.call(utm, u)) body[u] = utm[u];
+      }
+      if (token) body.captchaToken = token;
+
+      return fetch(ENDPOINT, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      }).then(function (res) {
+        return res
+          .json()
+          .catch(function () {
+            return {};
+          })
+          .then(function (json) {
+            if (!res.ok || !json.ok) throw new Error((json && json.error) || 'request_failed');
+            return json;
+          });
+      });
+    });
+  }
+
+  function collectPayload(form) {
+    var fd = new FormData(form);
+    var p = {};
+    fd.forEach(function (v, k) {
+      if (typeof v === 'string') p[k] = v;
+    });
+    // Услуга: вместо slug кладём человекочитаемый текст выбранной опции.
+    var sel = form.querySelector('select[name="service"]');
+    if (sel && sel.selectedOptions && sel.selectedOptions[0]) {
+      p.service = sel.selectedOptions[0].textContent.trim();
+    }
+    return p;
+  }
+
+  // Экспорт для калькулятора и прочих кастомных форм.
+  window.intelisLead = {
+    endpoint: ENDPOINT,
+    hasCaptcha: !!CAPTCHA_KEY,
+    getUtm: getStoredUtm,
+    send: sendLead,
+  };
+
+  // ─── helpers UI ──────────────────────────────────────────────────────────
   function getSubmitButton(form) {
     return form.querySelector('button[type="submit"]');
   }
@@ -83,10 +241,12 @@
     }, 250);
   }
 
-  function showError(form) {
+  function showError(form, message) {
     // Удаляем старое сообщение об ошибке, если было
     var prev = form.querySelector('.lead-error');
     if (prev) prev.remove();
+
+    var text = message || 'Проверьте соединение и попробуйте ещё раз.';
 
     var err = document.createElement('div');
     err.className = 'lead-error';
@@ -101,7 +261,7 @@
         '</div>' +
         '<div class="lead-error__body">' +
           '<strong class="lead-error__title">Не удалось отправить</strong>' +
-          '<span class="lead-error__text">Проверьте соединение и попробуйте ещё раз.</span>' +
+          '<span class="lead-error__text">' + text + '</span>' +
         '</div>' +
         '<button type="button" class="lead-error__retry">Попробовать снова</button>' +
       '</div>';
@@ -117,12 +277,11 @@
     });
   }
 
-  // ─── имитация запроса ──────────────────────────────────────────────────
+  // ─── имитация запроса (preview без бэкенда) ───────────────────────────────
   function fakeSubmit(form) {
     var delay = 800 + Math.random() * 400; // 800–1200ms
     return new Promise(function (resolve, reject) {
       window.setTimeout(function () {
-        // Эмуляция ошибки: ?form_error=1 в URL
         try {
           var p = new URLSearchParams(window.location.search);
           if (p.get('form_error') === '1') return reject(new Error('emulated'));
@@ -152,15 +311,19 @@
       var prevErr = form.querySelector('.lead-error');
       if (prevErr) prevErr.remove();
 
-      fakeSubmit(form).then(
+      var request = ENDPOINT ? sendLead(collectPayload(form), form) : fakeSubmit(form);
+
+      request.then(
         function () {
-          // Аналитика — заглушка для будущей интеграции
-          // window.dataLayer && window.dataLayer.push({ event: 'lead_submit', source: form.dataset.source });
           showSuccess(form);
         },
-        function () {
+        function (err) {
           clearLoading(form, btn);
-          showError(form);
+          var msg =
+            err && err.message === 'captcha_failed'
+              ? 'Не прошла проверка от спама. Обновите страницу и попробуйте ещё раз.'
+              : null;
+          showError(form, msg);
         }
       );
     },
