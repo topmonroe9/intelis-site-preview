@@ -216,7 +216,7 @@
         '</svg>' +
       '</div>' +
       '<h3 class="lead-success__title">Заявка принята</h3>' +
-      '<p class="lead-success__text">Перезвоним в течение часа в рабочее время. Если срочно — звоните <a href="tel:+74959958258">+7 (495) 995-82-58</a>.</p>';
+      '<p class="lead-success__text">Перезвоним в течение часа в рабочее время. Если срочно — звоните <a href="tel:+74950237022">+7 (495) 023-70-22</a>.</p>';
 
     // Подгоняем стиль success-блока под вариант: card / plain / compact
     if (form.classList.contains('rounded-pill')) {
