@@ -12,7 +12,11 @@
  * Антиспам: Yandex SmartCaptcha (invisible) + honeypot-поле `_hp`.
  * UTM-метки перехватываются из URL и хранятся в sessionStorage.
  *
+ * Телефон: маска +7 (XXX) XXX-XX-XX на всех input[type="tel"] (включая
+ * калькулятор), до отправки форма проверяется — имя, 10 цифр номера, согласие.
+ *
  * Состояния: loading → success (зелёный блок) / error (красное сообщение + retry).
+ * Текст ошибки зависит от причины: неверные данные, нет сети, сбой сервера.
  *
  * Calculator (Preact) переиспользует отправку через window.intelisLead.send().
  */
@@ -125,6 +129,115 @@
     });
   }
 
+  // ─── Маска телефона ──────────────────────────────────────────────────────
+  var PHONE_LEN = 11; // 7 + 10 цифр
+
+  /** Цифры номера, всегда с кодом страны 7 впереди (8 → 7, «999…» → «7999…»). */
+  function phoneDigits(value) {
+    var d = String(value || '').replace(/\D/g, '');
+    if (!d) return '';
+    if (d.charAt(0) === '8') d = '7' + d.slice(1);
+    else if (d.charAt(0) !== '7') d = '7' + d;
+    return d.slice(0, PHONE_LEN);
+  }
+
+  function formatPhone(d) {
+    if (!d) return '';
+    var out = '+7';
+    if (d.length > 1) out += ' (' + d.slice(1, 4);
+    if (d.length >= 4) out += ')';
+    if (d.length > 4) out += ' ' + d.slice(4, 7);
+    if (d.length > 7) out += '-' + d.slice(7, 9);
+    if (d.length > 9) out += '-' + d.slice(9, 11);
+    return out;
+  }
+
+  function isPhoneComplete(value) {
+    return phoneDigits(value).length === PHONE_LEN;
+  }
+
+  // Позиция в отформатированной строке сразу после n-й цифры.
+  function caretAfterDigit(str, n) {
+    if (n <= 0) return 0;
+    for (var i = 0, seen = 0; i < str.length; i++) {
+      if (/\d/.test(str.charAt(i)) && ++seen === n) return i + 1;
+    }
+    return str.length;
+  }
+
+  function onPhoneInput(e) {
+    var el = e.target;
+    if (!(el instanceof HTMLInputElement) || el.type !== 'tel') return;
+
+    var raw = el.value;
+    var caret = el.selectionStart == null ? raw.length : el.selectionStart;
+    var rawDigits = raw.replace(/\D/g, '');
+    var before = raw.slice(0, caret).replace(/\D/g, '').length;
+
+    // Backspace по скобке/дефису: цифр не убавилось — удаляем цифру перед курсором,
+    // иначе маска тут же вернёт символ обратно и стереть номер будет нельзя.
+    var prev = el.dataset.phonePrev || '';
+    if (
+      e.inputType === 'deleteContentBackward' &&
+      rawDigits === prev.replace(/\D/g, '') &&
+      before > 0
+    ) {
+      rawDigits = rawDigits.slice(0, before - 1) + rawDigits.slice(before);
+      before -= 1;
+    }
+
+    var digits = phoneDigits(rawDigits);
+    // Если код страны дописали сами — курсор сдвигается на одну цифру.
+    if (rawDigits && /^[^78]/.test(rawDigits)) before += 1;
+
+    var formatted = formatPhone(digits);
+    el.value = formatted;
+    el.dataset.phonePrev = formatted;
+    if (document.activeElement === el) {
+      var pos = caretAfterDigit(formatted, Math.min(before, digits.length));
+      try { el.setSelectionRange(pos, pos); } catch (_) {}
+    }
+  }
+
+  // capture — раньше обработчиков Preact в калькуляторе, они уже читают отформатированное значение.
+  document.addEventListener('input', onPhoneInput, true);
+
+  // ─── Тексты ошибок ───────────────────────────────────────────────────────
+  var MESSAGES = {
+    name_required: 'Укажите, как к вам обращаться.',
+    phone_required: 'Укажите номер телефона.',
+    phone_invalid: 'Номер телефона указан неполностью: нужно 10 цифр после +7.',
+    agree_required: 'Нужно согласие на обработку персональных данных.',
+    name_and_phone_required: 'Заполните имя и номер телефона.',
+    captcha_failed: 'Не прошла проверка от спама. Обновите страницу и попробуйте ещё раз.',
+    network: 'Нет соединения с интернетом. Проверьте сеть и попробуйте ещё раз.',
+    server: 'Сервис заявок временно недоступен. Попробуйте позже или позвоните нам: +7 (495) 023-70-22.',
+  };
+
+  var INVALID_DATA = {
+    name_required: 1,
+    phone_required: 1,
+    phone_invalid: 1,
+    agree_required: 1,
+    name_and_phone_required: 1,
+  };
+
+  function errorMessage(err) {
+    var code = (err && err.message) || '';
+    return MESSAGES[code] || MESSAGES.server;
+  }
+
+  /**
+   * Проверка полей до отправки. Возвращает null или {code, field} —
+   * field указывает, на какое поле перевести фокус.
+   */
+  function validatePayload(p) {
+    if (!String(p.name || '').trim()) return { code: 'name_required', field: 'name' };
+    if (!String(p.phone || '').trim()) return { code: 'phone_required', field: 'phone' };
+    if (!isPhoneComplete(p.phone)) return { code: 'phone_invalid', field: 'phone' };
+    return null;
+  }
+
   // ─── Отправка заявки ─────────────────────────────────────────────────────
   /**
    * Отправляет заявку на бэкенд. `container` — DOM-элемент (форма) для рендера
@@ -146,6 +259,9 @@
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body),
+      }).catch(function () {
+        // fetch падает только без сети / при обрыве соединения
+        throw new Error('network');
       }).then(function (res) {
         return res
           .json()
@@ -180,6 +296,8 @@
     hasCaptcha: !!CAPTCHA_KEY,
     getUtm: getStoredUtm,
     send: sendLead,
+    validate: validatePayload,
+    errorMessage: errorMessage,
   };
 
   // ─── helpers UI ──────────────────────────────────────────────────────────
@@ -241,12 +359,13 @@
     }, 250);
   }
 
-  function showError(form, message) {
+  /** title задан — это ошибка в данных: свой заголовок и без кнопки повтора. */
+  function showError(form, message, title) {
     // Удаляем старое сообщение об ошибке, если было
     var prev = form.querySelector('.lead-error');
     if (prev) prev.remove();
 
-    var text = message || 'Проверьте соединение и попробуйте ещё раз.';
+    var text = message || MESSAGES.server;
 
     var err = document.createElement('div');
     err.className = 'lead-error';
@@ -260,10 +379,10 @@
           '</svg>' +
         '</div>' +
         '<div class="lead-error__body">' +
-          '<strong class="lead-error__title">Не удалось отправить</strong>' +
+          '<strong class="lead-error__title">' + (title || 'Не удалось отправить') + '</strong>' +
           '<span class="lead-error__text">' + text + '</span>' +
         '</div>' +
-        '<button type="button" class="lead-error__retry">Попробовать снова</button>' +
+        (title ? '' : '<button type="button" class="lead-error__retry">Попробовать снова</button>') +
       '</div>';
 
     // Compact — короче padding, plain/card — обычный
@@ -272,10 +391,43 @@
     }
 
     form.prepend(err);
-    err.querySelector('.lead-error__retry').addEventListener('click', function () {
+    var retry = err.querySelector('.lead-error__retry');
+    if (retry) retry.addEventListener('click', function () {
       err.remove();
     });
   }
+
+  function markInvalid(form, field) {
+    var el = form.querySelector('[name="' + field + '"]');
+    if (!el) return;
+    el.setAttribute('aria-invalid', 'true');
+    el.classList.add('lead-invalid');
+    try { el.focus(); } catch (_) {}
+  }
+
+  function clearInvalid(form) {
+    var list = form.querySelectorAll('.lead-invalid');
+    for (var i = 0; i < list.length; i++) {
+      list[i].classList.remove('lead-invalid');
+      list[i].removeAttribute('aria-invalid');
+    }
+  }
+
+  // Подсветку поля снимаем, как только его начали править.
+  document.addEventListener('input', function (e) {
+    var el = e.target;
+    if (el && el.classList && el.classList.contains('lead-invalid')) {
+      el.classList.remove('lead-invalid');
+      el.removeAttribute('aria-invalid');
+    }
+  });
+  document.addEventListener('change', function (e) {
+    var el = e.target;
+    if (el && el.classList && el.classList.contains('lead-invalid')) {
+      el.classList.remove('lead-invalid');
+      el.removeAttribute('aria-invalid');
+    }
+  });
 
   // ─── имитация запроса (preview без бэкенда) ───────────────────────────────
   function fakeSubmit(form) {
@@ -304,14 +456,25 @@
       // Защита от множественных кликов
       if (form.getAttribute(BUSY_ATTR) === '1') return;
 
-      var btn = getSubmitButton(form);
-      setLoading(form, btn);
-
       // Чистим прошлую ошибку
       var prevErr = form.querySelector('.lead-error');
       if (prevErr) prevErr.remove();
+      clearInvalid(form);
 
-      var request = ENDPOINT ? sendLead(collectPayload(form), form) : fakeSubmit(form);
+      var payload = collectPayload(form);
+      var invalid = validatePayload(payload);
+      var agree = form.querySelector('input[name="agree"]');
+      if (!invalid && agree && !agree.checked) invalid = { code: 'agree_required', field: 'agree' };
+      if (invalid) {
+        markInvalid(form, invalid.field);
+        showError(form, MESSAGES[invalid.code], 'Проверьте данные');
+        return;
+      }
+
+      var btn = getSubmitButton(form);
+      setLoading(form, btn);
+
+      var request = ENDPOINT ? sendLead(payload, form) : fakeSubmit(form);
 
       request.then(
         function () {
@@ -319,11 +482,14 @@
         },
         function (err) {
           clearLoading(form, btn);
-          var msg =
-            err && err.message === 'captcha_failed'
-              ? 'Не прошла проверка от спама. Обновите страницу и попробуйте ещё раз.'
-              : null;
-          showError(form, msg);
+          var code = err && err.message;
+          // Сервер мог отклонить данные — тогда это не сбой, а просьба поправить поле.
+          if (INVALID_DATA[code]) {
+            markInvalid(form, code === 'name_and_phone_required' ? 'name' : 'phone');
+            showError(form, errorMessage(err), 'Проверьте данные');
+          } else {
+            showError(form, errorMessage(err));
+          }
         }
       );
     },
@@ -363,6 +529,8 @@
     '.lead-error__retry{flex:none;font-family:var(--font-display);font-weight:700;font-size:12px;letter-spacing:.04em;text-transform:uppercase;padding:8px 14px;border-radius:999px;background:var(--color-error);color:#fff;border:0;cursor:pointer;transition:opacity .15s, transform .12s}' +
     '.lead-error__retry:hover{opacity:.92;transform:translateY(-1px)}' +
     '.lead-error--compact{margin-bottom:8px}' +
+    '.lead-invalid{border-color:var(--color-error)!important;box-shadow:0 0 0 2px rgba(211,74,71,.15)!important}' +
+    'input[type="checkbox"].lead-invalid{outline:2px solid var(--color-error);outline-offset:2px}' +
     '.lead-error--compact .lead-error__inner{padding:10px 12px;font-size:12.5px}' +
 
     '@media (prefers-reduced-motion: reduce){' +
